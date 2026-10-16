@@ -160,7 +160,21 @@ def auto_crear_ficha_tecnica(sender, instance, created, **kwargs):
 # ============================================================
 # 4. RELACIÓN N:M CON MODELO INTERMEDIO (OrdenDespacho y DetalleDespacho)
 # ============================================================
+# Lab 8 - Ejercicio 9: QuerySet personalizado para OrdenDespacho
+class OrdenDespachoQuerySet(models.QuerySet):
+    def entregadas(self):
+        return self.filter(estado='Entregado')
+
+    def en_transito(self):
+        return self.filter(estado='En Tránsito')
+
+    def borradores(self):
+        return self.filter(estado='Borrador')
+
+
 class OrdenDespacho(models.Model):
+    objects = OrdenDespachoQuerySet.as_manager()
+
     ESTADOS_DESPACHO = [
         ('Borrador', 'Borrador'),
         ('En Tránsito', 'En Tránsito'),

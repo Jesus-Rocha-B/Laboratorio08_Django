@@ -1,371 +1,140 @@
-# Laboratorio 07 — ORM Avanzado: Transacciones Atómicas, Agregaciones Analíticas, QuerySets Personalizados y Rendimiento SQL
+# Laboratorio 08 — Construcción de una API REST Empresarial con Django REST Framework (DRF)
 
-**Curso:** Desarrollo de Aplicaciones Empresariales
-**Institución:** Tecsup
-**Sección:** 4 - C24 - Sección CD
-**Docente:** Yunior Bestard Aroche
+**Curso:** Desarrollo de Aplicaciones Empresariales  
+**Institución:** Tecsup  
+**Sección:** 4 - C24 - Sección CD  
+**Docente:** Yunior Bestard Aroche  
 
 **Integrantes:**
-
 1. Jesús Enrique Rocha Bobadilla
 2. Erick Arturo Gamarra Mundaca
 
-**Proyecto:** UrbanTrend — Plataforma Textil Streetwear y Sistema Logístico Avanzado con Django ORM y SQLite
-
-**Repositorio GitHub:** https://github.com/ErickGamarra/Django_Lab07
-
----
-
-## 🎯 1. Objetivo del Laboratorio 07
-
-El Laboratorio 06 resolvió el modelado relacional y el CRUD básico sobre el ORM de Django. El Laboratorio 07 da el salto hacia **patrones de concurrencia y persistencia avanzada**: ya no basta con que la aplicación "guarde datos", sino que debe garantizar que lo haga de forma **consistente, segura frente a accesos simultáneos y eficiente a nivel SQL**.
-
-Esta transición se aplica sobre dos dominios del proyecto UrbanTrend:
-
-- **`store` (comercial):** catálogo, ventas y reportes comerciales de prendas streetwear.
-- **`logistics` (insumos textiles):** categorías de materiales, fichas técnicas, stock y órdenes de despacho.
-
-Los **5 pilares** del laboratorio son:
-
-- **Integridad ACID con `transaction.atomic()`:** operaciones multi-modelo que se confirman completas o se revierten por completo (*commit* / *rollback*).
-- **Prevención de *race conditions* con `F()`:** las actualizaciones de stock se resuelven dentro de la base de datos (`UPDATE ... SET stock = stock - n`), no en memoria de Python.
-- **Analítica en base de datos con `aggregate()` / `annotate()`:** totales, promedios y agrupaciones calculados por el motor SQL, no iterando objetos en la vista.
-- **Encapsulamiento con `QuerySet.as_manager()`:** reglas de negocio reutilizables y encadenables, definidas una sola vez en el modelo.
-- **Eliminación empírica de consultas N+1 con `select_related()`:** medición con `connection.queries` y reducción de `1 + 2N` consultas a una sola con `JOIN`.
+**Proyecto:** UrbanTrend — Plataforma Textil Streetwear y Sistema Logístico Avanzado con Django ORM, SQLite y Django REST Framework  
+**Repositorio GitHub:** [https://github.com/Jesus-Rocha-B/Laboratorio08_Django.git](https://github.com/Jesus-Rocha-B/Laboratorio08_Django.git)
 
 ---
 
-## 🏗️ 2. Arquitectura de Módulos y Dominio Relacional
+## 🎯 1. Objetivo del Laboratorio 08
 
-### 2.1 Árbol del proyecto
+El Laboratorio 08 implementa una arquitectura desacoplada exponiendo los recursos de la aplicación empresarial como servicios web a través de **Django REST Framework (DRF)**.
+
+Se cubrieron dos grandes dominios:
+1. **PARTE 1 — Dominio Comercial (`store`):** Exposición de catálogo de prendas, pedidos y detalles anidados, implementando validaciones de negocio, vistas genéricas, ViewSets, routers, filtros y acciones personalizadas.
+2. **PARTE 2 — Dominio de Investigación Propia (`logistics`):** Exposición de insumos textiles, proveedores y órdenes de despacho con relaciones anidadas, optimización de consultas SQL (resolución del problema $N+1$), búsqueda, ordenamiento y acciones propias reutilizando QuerySets de la Semana 7.
+
+---
+
+## 🏗️ 2. Arquitectura de la API REST
+
+### 2.1 Estructura Modular de Endpoints (`/api/`)
+
+Todos los recursos se encuentran unificados bajo un enrutador central `DefaultRouter` en `config/api_urls.py`, accesible a través del API Root:
 
 ```text
-Django_Lab07/
-├── requirements.txt
-├── manage.py
-├── db.sqlite3
-└── src/
-    ├── core/                              # Configuración del proyecto
-    │   ├── __init__.py
-    │   ├── settings.py                    # INSTALLED_APPS, DB SQLite, templates
-    │   ├── urls.py                        # Enrutador raíz (admin, store, logistics)
-    │   ├── asgi.py
-    │   └── wsgi.py
-    │
-    ├── store/                             # Dominio comercial
-    │   ├── models.py                      # Producto, Venta (y relacionados)
-    │   ├── views.py                       # reportes_view (panel comercial de ventas)
-    │   ├── urls.py                        # /reportes/
-    │   ├── admin.py
-    │   ├── migrations/
-    │   └── templates/store/
-    │       └── reportes.html              # Panel comercial de ventas
-    │
-    └── logistics/                         # Dominio logístico de insumos textiles
-        ├── models.py                      # Categoria, Material (+ MaterialQuerySet),
-        │                                  # FichaTecnica, OrdenDespacho, DetalleDespacho
-        ├── views.py                       # despacho_transaccional_view,
-        │                                  # reporte_logistica_view, materiales_view
-        ├── urls.py                        # /logistics/despacho/transaccional/,
-        │                                  # /logistics/reporte/, /logistics/materiales/
-        ├── admin.py
-        ├── migrations/
-        └── templates/logistics/
-            ├── despacho_transaccional.html  # Formulario + resultado de la transacción
-            ├── reporte.html                 # Dashboard gerencial (KPIs + tablas)
-            └── materiales.html              # Catálogo optimizado con select_related
-```
-
-### 2.2 Resumen técnico de entidades
-
-| Relación | Entidades | Implementación Django | Descripción |
-|:---|:---|:---|:---|
-| **1:N** | `Categoria` → `Material` | `ForeignKey(Categoria, related_name='materiales')` | Una categoría (telas, hilos, avíos) agrupa muchos materiales. |
-| **1:1** | `Material` → `FichaTecnica` | `OneToOneField(Material, related_name='ficha')` | Cada material posee una única ficha con sus especificaciones técnicas. |
-| **N:M intermedio** | `OrdenDespacho` ↔ `Material` mediante `DetalleDespacho` | Modelo intermedio con dos `ForeignKey` y atributos propios | La tabla puente almacena datos históricos del despacho (`cantidad`, `precio_unitario`), que no cambian aunque el material se modifique después. |
-
-```python
-class Categoria(models.Model):
-    nombre = models.CharField(max_length=80, unique=True)
-
-
-class Material(models.Model):
-    categoria = models.ForeignKey(Categoria, on_delete=models.PROTECT, related_name="materiales")
-    nombre = models.CharField(max_length=120)
-    stock = models.PositiveIntegerField(default=0)
-    precio_unitario = models.DecimalField(max_digits=10, decimal_places=2)
-
-    objects = MaterialQuerySet.as_manager()   # Sección 5
-
-
-class FichaTecnica(models.Model):
-    material = models.OneToOneField(Material, on_delete=models.CASCADE, related_name="ficha")
-    composicion = models.CharField(max_length=150)
-    gramaje = models.PositiveIntegerField(help_text="g/m²")
-
-
-class OrdenDespacho(models.Model):
-    codigo = models.CharField(max_length=20, unique=True)
-    fecha = models.DateTimeField(auto_now_add=True)
-    materiales = models.ManyToManyField(Material, through="DetalleDespacho")
-
-
-class DetalleDespacho(models.Model):
-    orden = models.ForeignKey(OrdenDespacho, on_delete=models.CASCADE, related_name="detalles")
-    material = models.ForeignKey(Material, on_delete=models.PROTECT)
-    cantidad = models.PositiveIntegerField()
-    precio_unitario = models.DecimalField(max_digits=10, decimal_places=2)  # histórico
+/api/
+├── /prendas/      -> PrendaViewSet (CRUD completo, SearchFilter, OrderingFilter)
+├── /pedidos/      -> PedidoReadOnlyViewSet (Solo lectura, prefetch_related, @action /pagados/)
+├── /materiales/   -> MaterialViewSet (CRUD completo, validación precio > 0, @action /con_stock/)
+├── /proveedores/  -> ProveedorViewSet (CRUD completo, validación RUC 11 dígitos)
+└── /despachos/    -> OrdenDespachoReadOnlyViewSet (Solo lectura, select_related + prefetch_related, @action /entregadas/)
 ```
 
 ---
 
-## ⚡ 3. Control de Concurrencia y Transacciones Atómicas (ACID)
+## 📦 3. Recursos, Serializers y ViewSets Implementados
 
-La vista `despacho_transaccional_view` registra una orden de despacho que involucra **tres modelos** (`Material`, `OrdenDespacho`, `DetalleDespacho`). Todo ocurre dentro de un bloque `transaction.atomic()`:
+### 3.1 Dominio Comercial (`store`)
 
-- `select_for_update()` bloquea la fila del material hasta que termina la transacción, evitando que otro proceso lea un stock obsoleto.
-- `F('stock') - cantidad` delega la resta al motor SQL, eliminando la *race condition* del patrón leer-modificar-guardar en Python.
-- `simular_error` es una compuerta de fallo deliberado **después** de las escrituras, para demostrar empíricamente el *rollback*.
+| Recurso | Tipo | Serializer | ViewSet / Vistas | Reglas de Negocio / Optimizaciones |
+| :--- | :--- | :--- | :--- | :--- |
+| **Prenda** | Recurso Simple | `PrendaSerializer` | `PrendaViewSet` (ModelViewSet) | Validación `validate_precio` (`precio > 0.00`). |
+| **Pedido** | Recurso con Relaciones | `PedidoConDetallesSerializer`<br>`DetallePedidoSerializer` | `PedidoReadOnlyViewSet` (ReadOnlyModelViewSet) | Serialización anidada de detalles y prendas. `get_queryset()` optimizado con `prefetch_related('detalles__prenda')`. |
 
-```python
-from django.db import transaction
-from django.db.models import F
-from django.shortcuts import render
-from .models import Material, OrdenDespacho, DetalleDespacho
+### 3.2 Dominio Logístico de Investigación (`logistics`)
 
-
-def despacho_transaccional_view(request):
-    contexto = {"materiales": Material.objects.con_stock()}
-
-    if request.method == "POST":
-        material_id = int(request.POST["material"])
-        cantidad = int(request.POST["cantidad"])
-        simular_error = request.POST.get("simular_error") == "on"
-
-        try:
-            with transaction.atomic():
-                # 1) Bloqueo pesimista de la fila para esta transacción
-                material = Material.objects.select_for_update().get(pk=material_id)
-
-                if material.stock < cantidad:
-                    raise ValueError("Stock insuficiente para el despacho.")
-
-                # 2) Cabecera de la orden
-                orden = OrdenDespacho.objects.create(codigo=f"OD-{OrdenDespacho.objects.count() + 1:05d}")
-
-                # 3) Detalle con precio histórico
-                DetalleDespacho.objects.create(
-                    orden=orden,
-                    material=material,
-                    cantidad=cantidad,
-                    precio_unitario=material.precio_unitario,
-                )
-
-                # 4) Descuento atómico en la base de datos (sin race condition)
-                Material.objects.filter(pk=material.pk).update(stock=F("stock") - cantidad)
-
-                # 5) Compuerta de fallo: fuerza el rollback de los pasos 2, 3 y 4
-                if simular_error:
-                    raise RuntimeError("Error simulado: se revierte toda la transacción.")
-
-            contexto["resultado"] = f"✅ Orden {orden.codigo} confirmada (COMMIT)."
-        except Exception as exc:
-            contexto["resultado"] = f"❌ Transacción revertida (ROLLBACK): {exc}"
-
-    return render(request, "logistics/despacho_transaccional.html", contexto)
-```
-
-### Comparativa de escenarios
-
-| Aspecto | ✅ Transacción Exitosa (`simular_error=False`) | ❌ Transacción Fallida / Rollback (`simular_error=True`) |
-|:---|:---|:---|
-| **Inicio** | `BEGIN` + `SELECT ... FOR UPDATE` sobre el material. | `BEGIN` + `SELECT ... FOR UPDATE` sobre el material. |
-| **Insert de `OrdenDespacho`** | Se ejecuta y queda visible tras el commit. | Se ejecuta dentro de la transacción, pero se descarta. |
-| **Insert de `DetalleDespacho`** | Se ejecuta y queda persistido. | Se ejecuta dentro de la transacción, pero se descarta. |
-| **Update de stock** | `UPDATE ... SET stock = stock - n` confirmado. | `UPDATE` revertido; el stock vuelve al valor original. |
-| **Excepción** | Ninguna. | `RuntimeError` lanzada tras las escrituras. |
-| **Cierre** | `COMMIT` | `ROLLBACK` |
-| **Estado final en BD** | Orden, detalle y stock descontado coherentes entre sí. | Sin orden, sin detalle y stock intacto: **ningún cambio parcial**. |
-| **Propiedad ACID demostrada** | Atomicidad y Durabilidad. | Atomicidad y Consistencia. |
-
-> **Nota:** SQLite no implementa `SELECT ... FOR UPDATE`; Django ignora `select_for_update()` en este motor sin lanzar error. Sin embargo, `transaction.atomic()` y `F()` sí funcionan, y el código queda listo para motores como PostgreSQL o MySQL, donde el bloqueo de fila sí se aplica.
+| Recurso | Tipo | Serializer | ViewSet / Vistas | Reglas de Negocio / Optimizaciones |
+| :--- | :--- | :--- | :--- | :--- |
+| **Material** | Recurso Simple | `MaterialSerializer` | `MaterialViewSet` (ModelViewSet) | Validación `validate_precio_unitario` (`precio_unitario > 0.00`) y `validate_stock`. |
+| **Proveedor** | Recurso Simple | `ProveedorSerializer` | `ProveedorViewSet` (ModelViewSet) | Validación `validate_ruc` (11 dígitos numéricos obligatorios). |
+| **OrdenDespacho**| Recurso con Relaciones | `OrdenDespachoConDetallesSerializer`<br>`DetalleDespachoSerializer` | `OrdenDespachoReadOnlyViewSet` (ReadOnlyModelViewSet) | Serialización anidada con `select_related('sucursal_destino', 'transportista')` y `prefetch_related('detalles__material')`. |
 
 ---
 
-## 📊 4. Panel Analítico y Consultas Agregadas en BD
+## 🔍 4. Búsqueda, Ordenamiento, Filtros y Acciones Propias
 
-En lugar de traer todos los registros a Python y sumar con bucles, los cálculos se delegan al motor SQL mediante `aggregate()` y `annotate()`.
+Se implementaron filtros globales y por parámetro, así como acciones `@action` que reutilizan métodos encapsulados en los QuerySets personalizados de la Semana 7:
 
-| Operación ORM | Consulta SQL Equivalente | Propósito en el Dominio Logístico |
-|:---|:---|:---|
-| `Material.objects.aggregate(total=Sum('stock'))` | `SELECT SUM(stock) AS total FROM logistics_material;` | KPI de **unidades totales** en inventario. |
-| `Material.objects.aggregate(valor=Sum(F('stock') * F('precio_unitario')))` | `SELECT SUM(stock * precio_unitario) AS valor FROM logistics_material;` | KPI de **valor monetario** del inventario. |
-| `Material.objects.aggregate(prom=Avg('precio_unitario'), n=Count('id'))` | `SELECT AVG(precio_unitario), COUNT(id) FROM logistics_material;` | KPIs de **precio promedio** y **cantidad de referencias**. |
-| `Categoria.objects.annotate(n_materiales=Count('materiales'))` | `SELECT c.*, COUNT(m.id) AS n_materiales FROM logistics_categoria c LEFT JOIN logistics_material m ON m.categoria_id = c.id GROUP BY c.id;` | Cuántos materiales tiene cada categoría. |
-| `Material.objects.values('categoria__nombre').annotate(stock_total=Sum('stock'))` | `SELECT c.nombre, SUM(m.stock) AS stock_total FROM logistics_material m JOIN logistics_categoria c ON c.id = m.categoria_id GROUP BY c.nombre;` | **Stock consolidado por categoría** para decisiones de reabastecimiento. |
-| `DetalleDespacho.objects.values('material__nombre').annotate(despachado=Sum('cantidad')).order_by('-despachado')` | `SELECT m.nombre, SUM(d.cantidad) AS despachado FROM logistics_detalledespacho d JOIN logistics_material m ON m.id = d.material_id GROUP BY m.nombre ORDER BY despachado DESC;` | **Ranking de materiales más despachados**. |
-
-### Dashboard gerencial `/logistics/reporte/`
-
-La vista `reporte_logistica_view` arma un panel de lectura para gerencia con:
-
-- **Tarjetas KPI** en la parte superior: unidades totales, valor del inventario, precio promedio y número de referencias activas (resultado de `aggregate()`).
-- **Tabla de stock por categoría:** agrupación con `values().annotate()`.
-- **Tabla de ranking de despachos:** materiales ordenados por cantidad despachada.
-- **Alertas de stock bajo:** listado generado con el QuerySet personalizado `stock_bajo()` (Sección 5).
+| Endpoint | Parámetro / Acción | Tipo | Función / Comportamiento |
+| :--- | :--- | :--- | :--- |
+| `/api/prendas/?search=Oversize` | `?search=` | `SearchFilter` | Búsqueda por texto en campos `nombre`, `marca`, `categoria`, `tipo`. |
+| `/api/prendas/?search=Rebel&ordering=-precio` | `&` combinado | Búsqueda + Orden | Filtra por marca "Rebel" y ordena de mayor a menor precio. |
+| `/api/pedidos/?estado=Pagado` | `?estado=` | Filtro por parámetro | Filtra pedidos según su estado mediante `get_queryset()`. |
+| `/api/pedidos/pagados/` | `@action(detail=False)` | Acción personalizada | Reutiliza `PedidoQuerySet.pagados()`. |
+| `/api/materiales/?search=Hilo&ordering=-precio_unitario` | `&` combinado | Búsqueda + Orden | Filtra insumos coincidentes con "Hilo" y ordena descendentemente por costo. |
+| `/api/materiales/con_stock/` | `@action(detail=False)` | Acción personalizada | Reutiliza `MaterialQuerySet.con_stock()`. |
+| `/api/despachos/?estado=Entregado` | `?estado=` | Filtro por parámetro | Filtra órdenes de despacho en estado "Entregado". |
+| `/api/despachos/entregadas/` | `@action(detail=False)` | Acción personalizada | Reutiliza `OrdenDespachoQuerySet.entregadas()`. |
 
 ---
 
-## 🧩 5. QuerySets Semánticos Personalizados (`.as_manager()`)
+## ⚡ 5. Medición Empírica del Rendimiento SQL (Problema $N+1$)
 
-Las reglas de negocio de lectura se encapsulan en un `QuerySet` propio, que luego se expone como *manager* del modelo.
+Se realizaron pruebas empíricas mediante el shell de Django con `django.db.connection.queries` para comprobar el impacto de la optimización con `select_related` y `prefetch_related`:
 
-```python
-from django.db import models
+### 5.1 Caso 1: `Pedido` y sus detalles anidados (`store`)
+* **Sin optimización (`Pedido.objects.all()`):** **17 consultas SQL**.
+* **Con optimización (`prefetch_related('detalles__prenda')`):** **3 consultas SQL**.
+* **Impacto:** Reducción del **82.3%** en el número de queries a la base de datos.
 
-
-class MaterialQuerySet(models.QuerySet):
-    def con_stock(self):
-        """Materiales con al menos una unidad disponible."""
-        return self.filter(stock__gt=0)
-
-    def stock_bajo(self, umbral=100):
-        """Materiales cuyo stock está por debajo del umbral de reposición."""
-        return self.filter(stock__lt=umbral)
-
-
-class Material(models.Model):
-    # ... campos definidos en la Sección 2 ...
-    objects = MaterialQuerySet.as_manager()
-```
-
-Uso desde las vistas y el shell:
-
-```python
-Material.objects.con_stock()                      # Solo con existencias
-Material.objects.stock_bajo()                     # Umbral por defecto: 100
-Material.objects.stock_bajo(umbral=50)            # Umbral personalizado
-Material.objects.con_stock().stock_bajo(30)       # Encadenamiento semántico
-Material.objects.con_stock().select_related("categoria", "ficha")
-```
-
-**Ventajas de implementación:**
-
-- **Encadenamiento semántico:** al heredar de `QuerySet`, los métodos se pueden combinar entre sí y con `filter()`, `order_by()`, `select_related()`, etc. El código se lee como una frase de negocio.
-- **Principio DRY en controladores:** la regla "qué es stock bajo" vive en un solo lugar; si el criterio cambia, no hay que editar cada vista.
-- **Compatibilidad con el CRUD estándar:** `.as_manager()` conserva `objects.all()`, `create()`, `get()`, el Django Admin y los formularios sin configuración adicional.
-- **Testeabilidad:** los filtros de negocio se prueban de forma aislada, sin depender de las vistas.
+### 5.2 Caso 2: `OrdenDespacho` con relaciones 1:1, 1:N y N:M (`logistics`)
+* **Sin optimización (`OrdenDespacho.objects.all()`):** **25 consultas SQL**.
+* **Con optimización (`select_related(...) + prefetch_related(...)`):** **3 consultas SQL**.
+* **Impacto:** Reducción del **88.0%** en consultas SQL hacia SQLite.
 
 ---
 
-## 🚀 6. Auditoría Empírica y Reducción del Problema N+1
+## 🌐 6. Códigos de Estado HTTP Verificados
 
-El problema N+1 aparece cuando, tras una consulta principal, se dispara **una consulta adicional por cada objeto** al acceder a sus relaciones. Para medirlo se usa `connection.queries` en el shell (`python manage.py shell`):
+Se verificaron con clientes de prueba (Thunder Client / Postman) los códigos de estado REST estándar:
 
-```python
-from django.db import connection, reset_queries
-from django.conf import settings
-from logistics.models import Material
-
-settings.DEBUG = True  # connection.queries solo registra con DEBUG=True
-
-# ---------- Escenario A: SIN optimizar ----------
-reset_queries()
-for m in Material.objects.all():
-    _ = m.categoria.nombre      # 1:N -> 1 consulta extra por material
-    _ = m.ficha.composicion     # 1:1 -> 1 consulta extra por material
-print("Sin optimizar:", len(connection.queries), "consultas")
-
-# ---------- Escenario B: CON select_related ----------
-reset_queries()
-for m in Material.objects.select_related("categoria", "ficha"):
-    _ = m.categoria.nombre
-    _ = m.ficha.composicion
-print("Optimizado:", len(connection.queries), "consulta(s)")
-```
-
-### Resultados de la auditoría (N = 9 materiales)
-
-| Escenario | Consultas SQL | Fórmula | Detalle |
-|:---|:---:|:---:|:---|
-| ❌ **Sin optimizar** | **19** | `1 + 2N` | 1 consulta base + 9 para `categoria` (1:N) + 9 para `ficha` (1:1). |
-| ✅ **Optimizado con `select_related`** | **1** | `1` | Una única consulta con `INNER JOIN` a `logistics_categoria` y `logistics_fichatecnica`. |
-| **Reducción** | **−18 consultas (≈ 94,7 %)** | — | El costo deja de crecer linealmente con el número de materiales. |
-
-SQL generado por el escenario optimizado:
-
-```sql
-SELECT m.*, c.*, f.*
-FROM logistics_material m
-INNER JOIN logistics_categoria c ON m.categoria_id = c.id
-INNER JOIN logistics_fichatecnica f ON f.material_id = m.id;
-```
-
-> El catálogo `/logistics/materiales/` ya implementa la versión optimizada, de modo que renderizar la lista no genera consultas adicionales por fila en el template.
+| Código HTTP | Petición de Prueba | Endpoint | Comportamiento |
+| :--- | :--- | :--- | :--- |
+| **`200 OK`** | `GET` | `/api/prendas/1/` | Lectura de recurso individual exitosa. |
+| **`201 Created`** | `POST` | `/api/prendas/` | Creación y persistencia de nuevo registro válido. |
+| **`400 Bad Request`**| `POST` | `/api/prendas/` | Captura de error de validación (precio <= 0). |
+| **`404 Not Found`** | `GET` | `/api/prendas/9999/` | Solicitud de identificador inexistente. |
+| **`204 No Content`**| `DELETE` | `/api/prendas/<id>/` | Eliminación exitosa sin contenido en el cuerpo. |
 
 ---
 
-## ⚖️ 7. Comparativa Arquitectónica: ORM Básico vs. ORM Avanzado
+## 💻 7. Instalación y Ejecución Local
 
-| Aspecto | ORM Básico (Lab 06) | ORM Avanzado (Lab 07) |
-|:---|:---|:---|
-| **Manejo de Stock** | `m.stock -= n; m.save()` en Python; vulnerable a *race conditions* (dos peticiones leen el mismo valor y una sobrescribe a la otra). | `update(stock=F('stock') - n)`: la resta se resuelve en SQL de forma atómica. |
-| **Múltiples Escrituras** | Varios `save()` / `create()` independientes; un fallo intermedio deja datos huérfanos o inconsistentes. | `transaction.atomic()`: todo se confirma o todo se revierte (ACID). |
-| **Lecturas Concurrentes** | Lectura sin bloqueo; el stock leído puede estar desactualizado al momento de escribir. | `select_for_update()` bloquea la fila durante la transacción (en motores que lo soportan). |
-| **Métricas / Totales** | Bucles en Python sobre todos los objetos (`sum(m.stock for m in ...)`): alto consumo de memoria y red. | `aggregate()` / `annotate()`: el motor SQL calcula y devuelve solo el resultado. |
-| **Filtros de Negocio** | `filter(stock__lt=100)` repetido y disperso en varias vistas. | `MaterialQuerySet` con `con_stock()` y `stock_bajo()`: lógica centralizada, encadenable y DRY. |
-| **Carga de Relaciones** | Acceso perezoso (*lazy*): problema N+1 (`1 + 2N` consultas). | `select_related()`: una sola consulta con `JOIN`. |
+1. **Clonar el repositorio:**
+   ```bash
+   git clone https://github.com/Jesus-Rocha-B/Laboratorio08_Django.git
+   cd Laboratorio08_Django
+   ```
 
----
+2. **Instalar dependencias:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-## 💻 8. Puesta en Marcha Local y Endpoints Clave
+3. **Ejecutar migraciones y sembrado de datos:**
+   ```bash
+   python src/manage.py migrate
+   python src/seed_prendas.py
+   python src/seed_logistics.py
+   ```
 
-### 8.1 Comandos (PowerShell)
+4. **Iniciar el servidor de desarrollo:**
+   ```bash
+   python src/manage.py runserver
+   ```
 
-```powershell
-# 1. Clonar el repositorio
-git clone https://github.com/Jesus-Rocha-B/Django_Lab06.git
-cd Django_Lab06
-
-# 2. Crear y activar el entorno virtual
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-
-# 3. Instalar dependencias
-pip install -r requirements.txt
-
-# 4. Aplicar migraciones
-python manage.py makemigrations
-python manage.py migrate
-
-# 5. (Opcional) Crear superusuario para el panel de administración
-python manage.py createsuperuser
-
-# 6. Levantar el servidor de desarrollo
-python manage.py runserver
-```
-
-### 8.2 Comandos equivalentes (Bash / Linux / macOS)
-
-```bash
-git clone https://github.com/Jesus-Rocha-B/Django_Lab06.git
-cd Django_Lab06
-
-python3 -m venv venv
-source venv/bin/activate
-
-pip install -r requirements.txt
-
-python manage.py makemigrations
-python manage.py migrate
-python manage.py createsuperuser   # opcional
-python manage.py runserver
-```
-
-### 8.3 Enlaces locales de prueba
-
-- **Despacho Transaccional con Rollback:** http://127.0.0.1:8000/logistics/despacho/transaccional/
-- **Panel Analítico de Logística:** http://127.0.0.1:8000/logistics/reporte/
-- **Catálogo Optimizado de Insumos:** http://127.0.0.1:8000/logistics/materiales/
-- **Panel Comercial de Ventas:** http://127.0.0.1:8000/reportes/
-- **Panel Administrativo Django:** http://127.0.0.1:8000/admin/
+5. **Navegar a la API interactiva de DRF:**
+   * API Root: `http://127.0.0.1:8000/api/`
+   * Catálogo de Prendas: `http://127.0.0.1:8000/api/prendas/`
+   * Pedidos Anidados: `http://127.0.0.1:8000/api/pedidos/`
+   * Insumos Textiles: `http://127.0.0.1:8000/api/materiales/`
+   * Despachos Anidados: `http://127.0.0.1:8000/api/despachos/`

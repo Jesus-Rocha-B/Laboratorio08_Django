@@ -279,7 +279,21 @@ ESTADO_PEDIDO_CHOICES = [
 ]
 
 
+# Lab 8 - Ejercicio 1: QuerySet personalizado para Pedido con filtro de estados
+class PedidoQuerySet(models.QuerySet):
+    def pagados(self):
+        return self.filter(estado='Pagado')
+
+    def pendientes(self):
+        return self.filter(estado='Pendiente')
+
+    def entregados(self):
+        return self.filter(estado='Entregado')
+
+
 class Pedido(models.Model):
+    objects = PedidoQuerySet.as_manager()
+
     codigo = models.CharField(max_length=20, unique=True, verbose_name="Código de Pedido")
     cliente_nombre = models.CharField(max_length=100, verbose_name="Nombre del Cliente")
     cliente_email = models.EmailField(verbose_name="Correo Electrónico")
